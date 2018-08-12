@@ -1,7 +1,7 @@
 /*
-  Scheme-like Lisp in Go 1.10 by SUZUKI Hisao (H30.8/5 -)
+  Scheme-like Lisp in Go 1.10 by SUZUKI Hisao (H30.8/5 - H30.8/12)
 
-  The Reader type and other potions are derived from
+  The Reader type and other portions are derived from
   Nukata Lisp in Go (https://github.com/nukata/lisp-in-go).
 */
 package main
@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"regexp"
 	"runtime"
@@ -19,18 +20,18 @@ import (
 	"sync"
 )
 
-const Version = 0.03
+const Version = 0.10
 
 type Any = interface{}
 
 // EofToken is a token which represents the end of file.
-var EofToken = errors.New("end of file")
+var EofToken = errors.New("#end-of-file")
 
-// NoneToken is a token which represents nothing.
-// (define v e) returns NoneToken.
-var NoneToken = errors.New("none")
+// VoidToken is a token which represents nothing.
+// (define v e) returns VoidToken.
+var VoidToken = errors.New("#void")
 
-// EvalError implements an `error` in evaluation.
+// EvalError implements an error in evaluation.
 type EvalError struct {
 	Message string
 	Trace   []string
@@ -42,7 +43,7 @@ func NewEvalError(msg string, x Any) *EvalError {
 }
 
 // err.Error() returns a textual representation of err.
-// It is defined to comply with `error` interface.
+// It is defined to comply with error interface.
 func (err *EvalError) Error() string {
 	s := "EvalError: " + err.Message
 	for _, line := range err.Trace {
@@ -63,18 +64,6 @@ type Cell struct {
 // Nil represents the empty list ().
 var Nil *Cell = nil
 
-// List(a, b, c) builds a list of Cells: (a . (b . (c . ()))).
-func List(j ...Any) *Cell {
-	var result Any = Nil
-	p := &result
-	for _, v := range j {
-		x := &Cell{v, Nil}
-		*p = x
-		p = &x.Cdr
-	}
-	return result.(*Cell)
-}
-
 // j.String() returns a textual representation of the list j.
 func (j *Cell) String() string {
 	return Str(j)
@@ -88,6 +77,30 @@ func (j *Cell) Head() *Cell {
 // j.Tail() is (cdr j) as *Cell.
 func (j *Cell) Tail() *Cell {
 	return j.Cdr.(*Cell)
+}
+
+// (a b c).FoldL(x, fn) returns fn(fn(fn(x, a), b), c).
+func (j *Cell) FoldL(x Any, fn func(Any, Any) Any) Any {
+	for j != Nil {
+		x = fn(x, j.Car)
+		j = j.Tail()
+	}
+	return x
+}
+
+// (a b c d).CompareAll(fn) returns fn(a, b) && fn(b, c) && fn(c, d).
+func (j *Cell) CompareAll(fn func(Any, Any) bool) bool {
+	x := j.Car
+	j = j.Tail()
+	for j != Nil {
+		y := j.Car
+		if !fn(x, y) {
+			return false
+		}
+		x = y
+		j = j.Tail()
+	}
+	return true
 }
 
 //----------------------------------------------------------------------
@@ -150,12 +163,19 @@ var LeftParenSym = NewSym("(")
 var RightParenSym = NewSym(")")
 var SingleQuoteSym = NewSym("'")
 
+var ConsSym = NewSym("cons")
+var ListSym = NewSym("list")
+var AppendSym = NewSym("append")
+
 // Expression keywords
 
+var AndSym = NewSym2("and", true)
 var BeginSym = NewSym2("begin", true)
 var DefineSym = NewSym2("define", true)
 var IfSym = NewSym2("if", true)
 var LambdaSym = NewSym2("lambda", true)
+var LetSym = NewSym2("let", true)
+var LetrecSym = NewSym2("letrec", true)
 var QuasiquoteSym = NewSym2("quasiquote", true)
 var QuoteSym = NewSym2("quote", true)
 var SetExclSym = NewSym2("set!", true)
@@ -164,89 +184,87 @@ var UnquoteSplicingSym = NewSym2("unquote-splicing", true)
 
 //----------------------------------------------------------------------
 
-// Env represents an environment, i.e., a list of symbol-value pairs.
-type Env struct {
-	Symbol *Sym
-	Value  Any
-	Next   *Env
+// Globals represents the global environment.
+// An environment will be repsensented as the list:
+// ((symbol1 . value1) ... (symbolN . valueN) globals)
+// where globals is an instance of Globals.
+type Globals struct {
+	Map   map[*Sym]Any
+	Mutex sync.RWMutex
 }
 
-// env.String() returns "{sym1=val1; sym2=val2; ...; symN=valN}".
-func (env *Env) String() string {
-	ss := make([]string, 0, 10)
-	for p := env; p != nil; p = p.Next {
-		s := fmt.Sprintf("%v=%v", p.Symbol, p.Value)
-		ss = append(ss, s)
-	}
-	return "{" + strings.Join(ss, "; ") + "}"
+// gl.String() returns "#N-symbols".
+func (gl *Globals) String() string {
+	return fmt.Sprintf("#%d-symbols", len(gl.Map))
 }
 
-// env.ShortString() returns a short representation of the env.
-func (env *Env) ShortString(items int) string {
-	ss := make([]string, 0, 10)
-	count := items
-	for p := env; p != nil; p = p.Next {
-		count--
-		if count == 0 {
-			ss = append(ss, "...")
-			break
-		}
-		s := fmt.Sprintf("%v", p.Symbol)
-		ss = append(ss, s)
-	}
-	return "{" + strings.Join(ss, " ") + "}"
-}
-
-// env.Prepend((sym1...), (val1...)) constructs a new environment
-// {sym1=val1; ...; the contents of env}.
-// env.Prepend(sym, (val1...)) constructs a new environment
-// {sym=(val1...); the contents of env}.
-func (env *Env) Prepend(symbols Any, values *Cell) *Env {
-	switch s := symbols.(type) {
-	case *Sym:
-		return &Env{s, values, env}
-	case *Cell:
-		var result *Env = nil
-		p := &result
-		v := values
-		for s != Nil {
-			x := &Env{s.Car.(*Sym), v.Car, nil}
-			*p = x
-			p = &x.Next
-			cdr, ok := s.Cdr.(*Cell)
-			if ok {
-				s = cdr
-				v = v.Tail()
-			} else { // (v1 v2 . v3)
-				*p = &Env{s.Cdr.(*Sym), v.Cdr, env}
-				return result
+// GetVar retrieves the value of sym from the environment.
+func GetVar(sym *Sym, env *Cell) Any {
+	j := env
+	for j != Nil {
+		switch x := j.Car.(type) {
+		case *Cell:
+			if x.Car == sym {
+				return x.Cdr
 			}
+			break
+		case *Globals:
+			x.Mutex.RLock()
+			v, ok := x.Map[sym]
+			x.Mutex.RUnlock()
+			if ok {
+				return v
+			}
+			break
+		default:
+			panic(NewEvalError("invalid environment", env))
 		}
-		*p = env
-		return result
+		j = j.Tail()
 	}
-	panic("not *Sym nor *Cell")
+	panic(NewEvalError("undefined variable", sym))
 }
 
-// Get the value for symbol.  It returns NoneToken if not found the symbol.
-func (env *Env) GetValueFor(symbol *Sym) Any {
-	for p := env; p != nil; p = p.Next {
-		if p.Symbol == symbol {
-			return p.Value
+// SetVar set the value of sym to value in the environment.
+func SetVar(sym *Sym, value Any, env *Cell) bool {
+	j := env
+	for j != Nil {
+		switch x := j.Car.(type) {
+		case *Cell:
+			if x.Car == sym {
+				x.Cdr = value
+				return true
+			}
+			break
+		case *Globals:
+			x.Mutex.Lock()
+			_, ok := x.Map[sym]
+			if ok {
+				x.Map[sym] = value
+			}
+			x.Mutex.Unlock()
+			if ok {
+				return true
+			}
+			break
+		default:
+			panic(NewEvalError("invalid environment", env))
 		}
-	}
-	return NoneToken
-}
-
-// Set the value for symbol.  It returns false if not found the symbol.
-func (env *Env) SetValueFor(symbol *Sym, value Any) bool {
-	for p := env; p != nil; p = p.Next {
-		if p.Symbol == symbol {
-			p.Value = value
-			return true
-		}
+		j = j.Tail()
 	}
 	return false
+}
+
+// DefineVar define sym in the envirnment and set it to value.
+func DefineVar(sym *Sym, value Any, env *Cell) {
+	if env != Nil {
+		if x, ok := env.Car.(*Globals); ok {
+			x.Mutex.Lock()
+			x.Map[sym] = value
+			x.Mutex.Unlock()
+			return
+		}
+	}
+	panic(NewEvalError("not top level to define", sym))
 }
 
 //----------------------------------------------------------------------
@@ -255,15 +273,15 @@ func (env *Env) SetValueFor(symbol *Sym, value Any) bool {
 type Expr struct {
 	Parameters  Any // *Sym or *Cell
 	Body        *Cell
-	Environment *Env
+	Environment *Cell
 }
 
-// expr.String() return "#[(s...) e... {s s s ...}]".
+// expr.String() return "#[(s...)| e...| env]".
 func (expr *Expr) String() string {
-	return fmt.Sprintf("#[%v %s %s]",
+	return fmt.Sprintf("#[%v| %s| %v]",
 		expr.Parameters,
 		strListBody(expr.Body, -1, nil),
-		expr.Environment.ShortString(4))
+		expr.Environment)
 }
 
 // Subr represents an intrinsic subroutine.
@@ -271,66 +289,9 @@ type Subr = func(*Cell) Any
 
 //----------------------------------------------------------------------
 
-// Interp represents a core of the interpreter.
-type Interp struct {
-	Globals map[*Sym]Any
-}
-
-// NewInterp constructs an interpreter and sets built-in functions etc. as
-// the global values of symbols within the interpreter.
-func NewInterp() *Interp {
-	interp := &Interp{Globals: make(map[*Sym]Any)}
-
-	interp.Def("car",
-		func(x *Cell) Any {
-			return x.Head().Car
-		})
-	interp.Def("cdr",
-		func(x *Cell) Any {
-			return x.Head().Cdr
-		})
-	interp.Def("cons",
-		func(x *Cell) Any {
-			return &Cell{x.Car, x.Tail().Car}
-		})
-	interp.Def("eq?",
-		func(x *Cell) Any {
-			return x.Car == x.Cdr
-		})
-	interp.Def("pair?",
-		func(x *Cell) Any {
-			a, ok := x.Car.(*Cell)
-			return ok && a != nil
-		})
-
-	interp.Def("+",
-		func(x *Cell) Any {
-			return x.Car.(float64) + x.Tail().Car.(float64)
-		})
-	interp.Def("interaction-environment",
-		func(x *Cell) Any {
-			var r *Env = nil
-			for key, value := range interp.Globals {
-				r = &Env{key, value, r}
-			}
-			return r
-		})
-	interp.Def("*version*",
-		List(Version,
-			fmt.Sprintf("%s %s/%s",
-				runtime.Version(), runtime.GOOS, runtime.GOARCH),
-			"Scheme-like Lisp"))
-	return interp
-}
-
-func (interp *Interp) Def(name string, value Any) {
-	symbol := NewSym(name)
-	interp.Globals[symbol] = value
-}
-
 const stackTraceMaxLength = 10
 
-func handlePanic(interp *Interp, expression Any) {
+func handlePanic(expression Any) {
 	if err := recover(); err != nil {
 		ex, ok := err.(*EvalError)
 		if !ok {
@@ -346,88 +307,149 @@ func handlePanic(interp *Interp, expression Any) {
 	}
 }
 
-// Eval always panics with an `error` if it panics.
-func (interp *Interp) Eval(expression Any, env *Env) Any {
-	defer handlePanic(interp, expression)
+// Eval always panics with an error if it panics.
+func Eval(expression Any, env *Cell) Any {
+	defer handlePanic(expression)
 	switch x := expression.(type) {
 	case *Sym:
-		r := env.GetValueFor(x)
-		if r == NoneToken {
-			g, ok := interp.Globals[x]
-			if !ok {
-				panic(NewEvalError("undefined variable", x))
-			}
-			r = g
-		}
-		return r
+		return GetVar(x, env)
 	case *Cell:
-		xcar := x.Car
+		xcar, xcdr := x.Car, x.Tail()
 		switch f := xcar.(type) {
 		case *Sym:
 			if f.IsKeyword {
-				if f == QuoteSym {
-					return x.Tail().Car
-				} else if f == IfSym { // (if e1 e2 e3)
-					e1 := interp.Eval(x.Tail().Car, env)
-					b, ok := e1.(bool)
-					if ok && !b { // if e1 is #f
-						return interp.Eval(x.Tail().Tail().Tail().Car, env)
+				if f == QuoteSym { // (quote e)
+					return xcdr.Car
+				} else if f == IfSym { // (if cond then [else])
+					cond := Eval(xcdr.Car, env)
+					b, ok := cond.(bool)
+					if ok && !b { // if cond is #f
+						xcdddr := xcdr.Tail().Tail()
+						if xcdddr == Nil {
+							return VoidToken
+						} else {
+							return Eval(xcdddr.Car, env)
+						}
 					} else {
-						return interp.Eval(x.Tail().Tail().Car, env)
+						return Eval(xcdr.Tail().Car, env)
 					}
 				} else if f == BeginSym { // (begin e...)
-					return interp.EvalBegin(x.Tail(), env)
+					return EvalBegin(xcdr, env)
 				} else if f == LambdaSym { // (lambda (v...) e...)
-					return &Expr{x.Tail().Car, x.Tail().Tail(), env}
-				} else if f == SetExclSym { // (set! v e)
-					sym := x.Tail().Car.(*Sym)
-					e1 := interp.Eval(x.Tail().Tail().Car, env)
-					if env.SetValueFor(sym, e1) {
-						return NoneToken
+					return &Expr{xcdr.Car, xcdr.Tail(), env}
+				} else if f == SetExclSym { // (set! sym val)
+					sym := xcdr.Car.(*Sym)
+					val := Eval(xcdr.Tail().Car, env)
+					if SetVar(sym, val, env) {
+						return VoidToken
 					}
-					_, ok := interp.Globals[sym]
-					if ok {
-						interp.Globals[sym] = e1
-						return NoneToken
-					}
-					panic(NewEvalError("undefined variable to set", x))
+					panic(NewEvalError("undefined variable to set", sym))
 				} else if f == DefineSym { // (define v e)
-					if env != nil {
-						panic(NewEvalError("not top level to define", f))
-					}
-					e1 := interp.Eval(x.Tail().Tail().Car, env)
-					interp.Globals[x.Tail().Car.(*Sym)] = e1
-					return NoneToken
+					EvalDefine(xcdr.Car, xcdr.Tail(), env)
+					return VoidToken
+				} else if f == LetSym { // (let ((v e)...) e...)
+					return EvalLet(xcdr.Head(), xcdr.Tail(), env)
+				} else if f == LetrecSym { // (letrec ((v e)...) e...)
+					return EvalLetrec(xcdr.Head(), xcdr.Tail(), env)
+				} else if f == AndSym { // (and e...)
+					return EvalAnd(xcdr, env)
+				} else if f == QuasiquoteSym { // (quasiquote e)
+					return Eval(QqExpand(xcdr.Car), env)
 				}
 				panic(NewEvalError("unknown keyword", f))
 			} else {
-				xcar = interp.Eval(f, env)
+				xcar = Eval(f, env)
 			}
 			break
 		case *Cell:
-			xcar = interp.Eval(f, env)
+			xcar = Eval(f, env)
 		}
-		return interp.Apply(xcar, interp.EvalList(x.Tail(), env))
+		return Apply(xcar, EvalList(xcdr, env))
 	}
 	return expression
 }
 
-// EvalBegin('((+ 1 2) 3 (+ 4 5)), GlobalEnv) returns 9 (= 4 + 5).
-func (interp *Interp) EvalBegin(j *Cell, env *Env) Any {
-	var result Any = Nil
+// EvalBegin('((+ 1 2) 3 (+ 4 5)), env) returns 9 (= 4 + 5).
+func EvalBegin(j *Cell, env *Cell) Any {
+	var result Any = VoidToken
 	for j != Nil {
-		result = interp.Eval(j.Car, env)
+		result = Eval(j.Car, env)
 		j = j.Tail()
 	}
 	return result
 }
 
-// EvalList('((+ 1 2) 3 (+ 4 5)), GlobalEnv) returns (3 3 9).
-func (interp *Interp) EvalList(args *Cell, env *Env) *Cell {
+// EvalAnd('( 1 2 3), env) returns 3.
+func EvalAnd(j *Cell, env *Cell) Any {
+	var result Any = true
+	for j != Nil {
+		result = Eval(j.Car, env)
+		b, ok := result.(bool)
+		if ok && !b {
+			return false
+		}
+		j = j.Tail()
+	}
+	return result
+}
+
+// EvalDefine(sym, body, env) defines sym as (car body) in env.
+// EvalDefine('(sym (param...)), body, env) defines sym as
+// (lambda (param ...) . body) in env.
+func EvalDefine(sym Any, body *Cell, env *Cell) {
+	var symbol *Sym
+	var value Any
+	switch s := sym.(type) {
+	case *Sym:
+		symbol = s
+		value = Eval(body.Car, env)
+		break
+	case *Cell:
+		symbol = s.Car.(*Sym)
+		params := s.Cdr
+		value = &Expr{params, body, env}
+		break
+	default:
+		panic(NewEvalError("invalid variable to define", sym))
+	}
+	DefineVar(symbol, value, env)
+}
+
+// EvalLet('((v a)...), (e...), env) evaluates ((lambda (v...) e...) a...).
+func EvalLet(bindings *Cell, body *Cell, env *Cell) Any {
+	var syms *Cell = Nil
+	var vals *Cell = Nil
+	for j := bindings; j != Nil; j = j.Tail() {
+		jcar := j.Head()
+		syms = &Cell{jcar.Car, syms}
+		vals = &Cell{jcar.Tail().Car, vals}
+	}
+	expr := &Expr{syms, body, env}
+	return Apply(expr, EvalList(vals, env))
+}
+
+// EvalLetrec('((v a)...), (e...), env) evaluates
+//  ((lambda (v...) (set! v a)... e...) <void>...).
+func EvalLetrec(bindings *Cell, body *Cell, env *Cell) Any {
+	var syms *Cell = Nil
+	var voids *Cell = Nil
+	for j := bindings; j != Nil; j = j.Tail() {
+		jcar := j.Head()
+		syms = &Cell{jcar.Car, syms}
+		voids = &Cell{VoidToken, voids}
+		set := &Cell{SetExclSym, &Cell{jcar.Car, &Cell{jcar.Tail().Car, Nil}}}
+		body = &Cell{set, body}
+	}
+	expr := &Expr{syms, body, env}
+	return Apply(expr, voids)
+}
+
+// EvalList('((+ 1 2) 3 (+ 4 5)), env) returns (3 3 9).
+func EvalList(args *Cell, env *Cell) *Cell {
 	var result Any = Nil
 	p := &result
 	for j := args; j != Nil; j = j.Tail() {
-		v := interp.Eval(j.Car, env)
+		v := Eval(j.Car, env)
 		x := &Cell{v, Nil}
 		*p = x
 		p = &x.Cdr
@@ -435,15 +457,176 @@ func (interp *Interp) EvalList(args *Cell, env *Env) *Cell {
 	return result.(*Cell)
 }
 
-func (interp *Interp) Apply(function Any, args *Cell) Any {
+// PairList((sym1...), (val1...), env) returns ((sym1 . val1)... . env).
+// PairList(sym, (val1...), env) returns ((sym . (val1...)) . env).
+func PairList(symbols Any, values *Cell, env *Cell) *Cell {
+	switch s := symbols.(type) {
+	case *Sym:
+		return &Cell{&Cell{s, values}, env}
+	case *Cell:
+		var result Any = Nil
+		p := &result
+		v := values
+		for s != Nil {
+			x := &Cell{&Cell{s.Car.(*Sym), v.Car}, Nil}
+			*p = x
+			p = &x.Cdr
+			scdr, ok := s.Cdr.(*Cell)
+			if ok {
+				s = scdr
+				v = v.Tail()
+			} else { // symbols = (v1 .. vN . vRest)
+				*p = &Cell{&Cell{s.Cdr.(*Sym), v.Cdr}, env}
+				return result.(*Cell)
+			}
+		}
+		*p = env
+		return result.(*Cell)
+	}
+	panic(NewEvalError("invalid symbol(s)", symbols))
+}
+
+// Apply calls function with args.
+func Apply(function Any, args *Cell) Any {
 	switch f := function.(type) {
 	case *Expr:
-		env := f.Environment.Prepend(f.Parameters, args)
-		return interp.EvalBegin(f.Body, env)
+		env := PairList(f.Parameters, args, f.Environment)
+		return EvalBegin(f.Body, env)
 	case Subr:
 		return f(args)
 	}
 	panic(NewEvalError("unknown function", function))
+}
+
+//----------------------------------------------------------------------
+// Quasi-Quotation
+
+// QqExpand expands x of any quasi-quote `x into the equivalent S-expression.
+func QqExpand(x Any) Any {
+	return qqExpand0(x, 0) // Begin with the nesting level 0.
+}
+
+// QqQuote quotes x so that the result evaluates to x.
+func QqQuote(x Any) Any {
+	if x == Nil {
+		return Nil
+	}
+	switch x.(type) {
+	case *Sym, *Cell:
+		return &Cell{QuoteSym, &Cell{x, Nil}}
+	default:
+		return x
+	}
+}
+
+func qqExpand0(x Any, level int) Any {
+	if j, ok := x.(*Cell); ok {
+		if j == Nil {
+			return Nil
+		}
+		if j.Car == UnquoteSym { // ,a
+			if level == 0 {
+				return j.Tail().Car // ,a => a
+			}
+		}
+		t := qqExpand1(j, level)
+		if t.Cdr == Nil {
+			if k, ok := t.Car.(*Cell); ok {
+				if k.Car == ListSym || k.Car == ConsSym {
+					return k
+				}
+			}
+		}
+		return &Cell{AppendSym, t}
+	} else {
+		return QqQuote(x)
+	}
+}
+
+// qqExpand1 expands x of `x so that the result can be used as an argument of
+// append.  Example 1: (,a b) => ((list a 'b))
+//          Example 2: (,a ,@(cons 2 3)) => ((cons a (cons 2 3)))
+func qqExpand1(x Any, level int) *Cell {
+	if j, ok := x.(*Cell); ok {
+		if j == Nil {
+			return &Cell{Nil, Nil}
+		}
+		switch j.Car {
+		case UnquoteSym: // ,a
+			if level == 0 {
+				return j.Tail() // ,a => (a)
+			}
+			level--
+		case QuasiquoteSym: // `a
+			level++
+		}
+		h := qqExpand2(j.Car, level)
+		t := qqExpand1(j.Cdr, level) // != Nil
+		if t.Car == Nil && t.Cdr == Nil {
+			return &Cell{h, Nil}
+		} else if hc, ok := h.(*Cell); ok {
+			if hc.Car == ListSym {
+				if tcar, ok := t.Car.(*Cell); ok {
+					if tcar.Car == ListSym {
+						hh := qqConcat(hc, tcar.Cdr)
+						return &Cell{hh, t.Cdr}
+					}
+				}
+				if hcdr, ok := hc.Cdr.(*Cell); ok {
+					hh := qqConsCons(hcdr, t.Car)
+					return &Cell{hh, t.Cdr}
+				}
+			}
+		}
+		return &Cell{h, t}
+	} else {
+		return &Cell{QqQuote(x), Nil}
+	}
+}
+
+// (1 2), (3 4) => (1 2 3 4)
+func qqConcat(x *Cell, y Any) Any {
+	if x == Nil {
+		return y
+	} else {
+		return &Cell{x.Car, qqConcat(x.Tail(), y)}
+	}
+}
+
+// (1 2 3), "a" => (cons 1 (cons 2 (cons 3 "a")))
+func qqConsCons(x *Cell, y Any) Any {
+	if x == Nil {
+		return y
+	} else {
+		return &Cell{ConsSym, &Cell{x.Car,
+			&Cell{qqConsCons(x.Tail(), y), Nil}}}
+	}
+}
+
+// qqExpand2 expands x.car (= y) of `x so that the result can be used as an
+// argument of append.
+// Examples: ,a => (list a); ,@(foo 1 2) => (foo 1 2); b => (list 'b)
+func qqExpand2(y Any, level int) Any {
+	if j, ok := y.(*Cell); ok {
+		if j == Nil {
+			return &Cell{ListSym, &Cell{Nil, Nil}} // (list nil)
+		}
+		switch j.Car {
+		case UnquoteSym: // ,a
+			if level == 0 {
+				return &Cell{ListSym, j.Cdr} // ,a => (list a)
+			}
+			level--
+		case UnquoteSplicingSym: // ,@a
+			if level == 0 {
+				return j.Tail().Car // ,@a => a
+			}
+			level--
+		case QuasiquoteSym: // `a
+			level++
+		}
+	}
+	return &Cell{ListSym, &Cell{qqExpand0(y, level), Nil}}
 }
 
 //----------------------------------------------------------------------
@@ -687,19 +870,207 @@ func strListBody(x *Cell, count int, printed map[*Cell]bool) string {
 
 //----------------------------------------------------------------------
 
-// SafeEval evaluates an expression in `env` and returns the result and nil.
+// MakeGlobalEnv constructs an environment which contains built-in values.
+func MakeGlobalEnv() *Cell {
+	gl := &Globals{Map: make(map[*Sym]Any)}
+	result := &Cell{gl, Nil}
+	__, m := NewSym, gl.Map
+
+	m[__("car")] = func(x *Cell) Any {
+		return x.Head().Car
+	}
+	m[__("cdr")] = func(x *Cell) Any {
+		return x.Head().Cdr
+	}
+	m[__("cons")] = func(x *Cell) Any {
+		obj1, obj2 := x.Car, x.Tail().Car
+		return &Cell{obj1, obj2}
+	}
+	m[__("pair?")] = func(x *Cell) Any {
+		a, ok := x.Car.(*Cell)
+		return ok && a != nil
+	}
+
+	eqv := func(x *Cell) Any {
+		obj1, obj2 := x.Car, x.Tail().Car
+		return obj1 == obj2
+	}
+	m[__("eq?")] = eqv
+	m[__("eqv?")] = eqv
+
+	m[__("null?")] = func(x *Cell) Any {
+		return x.Car == Nil
+	}
+
+	m[__("not")] = func(x *Cell) Any {
+		a, ok := x.Car.(bool)
+		return ok && !a
+	}
+
+	m[__("set-car!")] = func(x *Cell) Any {
+		pair, obj := x.Head(), x.Tail().Car
+		pair.Car = obj
+		return VoidToken
+	}
+	m[__("set-cdr!")] = func(x *Cell) Any {
+		pair, obj := x.Head(), x.Tail().Car
+		pair.Cdr = obj
+		return VoidToken
+	}
+	m[__("list")] = func(x *Cell) Any {
+		return x
+	}
+	m[__("append")] = appendNLists
+	m[__("length")] = func(x *Cell) Any {
+		return x.Head().FoldL(0.0, func(a, b Any) Any {
+			return a.(float64) + 1.0
+		})
+	}
+
+	m[__("+")] = func(x *Cell) Any {
+		return x.FoldL(0.0, func(a, b Any) Any {
+			return a.(float64) + b.(float64)
+		})
+	}
+	m[__("*")] = func(x *Cell) Any {
+		return x.FoldL(1.0, func(a, b Any) Any {
+			return a.(float64) * b.(float64)
+		})
+	}
+	m[__("-")] = func(x *Cell) Any {
+		a1 := x.Car.(float64)
+		if x.Cdr == Nil {
+			return -a1
+		} else {
+			return x.Tail().FoldL(a1, func(a, b Any) Any {
+				return a.(float64) - b.(float64)
+			})
+		}
+	}
+	m[__("/")] = func(x *Cell) Any {
+		a1 := x.Car.(float64)
+		if x.Cdr == Nil {
+			return 1 / a1
+		} else {
+			return x.Tail().FoldL(a1, func(a, b Any) Any {
+				return a.(float64) / b.(float64)
+			})
+		}
+	}
+
+	m[__("remainder")] = func(x *Cell) Any {
+		return math.Mod(x.Car.(float64), x.Tail().Car.(float64))
+	}
+
+	m[__("=")] = func(x *Cell) Any {
+		return x.CompareAll(func(a, b Any) bool {
+			return a.(float64) == b.(float64)
+		})
+	}
+	m[__("<")] = func(x *Cell) Any {
+		return x.CompareAll(func(a, b Any) bool {
+			return a.(float64) < b.(float64)
+		})
+	}
+	m[__(">")] = func(x *Cell) Any {
+		return x.CompareAll(func(a, b Any) bool {
+			return a.(float64) > b.(float64)
+		})
+	}
+	m[__("<=")] = func(x *Cell) Any {
+		return x.CompareAll(func(a, b Any) bool {
+			return a.(float64) <= b.(float64)
+		})
+	}
+	m[__(">=")] = func(x *Cell) Any {
+		return x.CompareAll(func(a, b Any) bool {
+			return a.(float64) >= b.(float64)
+		})
+	}
+
+	m[__("write")] = func(x *Cell) Any {
+		fmt.Print(Str2(x.Car, true))
+		return VoidToken
+	}
+	m[__("display")] = func(x *Cell) Any {
+		fmt.Print(Str2(x.Car, false))
+		return VoidToken
+	}
+	m[__("newline")] = func(x *Cell) Any {
+		fmt.Println()
+		return VoidToken
+	}
+
+	m[__("apply")] = func(x *Cell) Any {
+		return Apply(x.Car, x.Tail().Head())
+	}
+	m[__("eval")] = func(x *Cell) Any {
+		return Eval(x.Car, x.Tail().Head())
+	}
+
+	m[__("interaction-environment")] = func(x *Cell) Any {
+		return result
+	}
+	m[__("dump")] = func(x *Cell) Any {
+		j := Nil
+		symLock.RLock()
+		for _, sym := range symbols {
+			if sym.IsKeyword {
+				j = &Cell{sym, j}
+			}
+		}
+		symLock.RUnlock()
+		gl.Mutex.RLock()
+		for sym, val := range gl.Map {
+			j = &Cell{&Cell{sym, val}, j}
+		}
+		gl.Mutex.RUnlock()
+		return j
+	}
+	m[__("*version*")] = &Cell{Version,
+		&Cell{fmt.Sprintf("%s %s/%s",
+			runtime.Version(), runtime.GOOS, runtime.GOARCH),
+			&Cell{"Scheme-like Lisp", Nil}}}
+
+	return result
+}
+
+func appendNLists(x *Cell) Any {
+	car, tail := x.Car, x.Tail()
+	if tail == Nil {
+		return car
+	} else {
+		return append2Lists(car.(*Cell), appendNLists(tail))
+	}
+}
+
+func append2Lists(list *Cell, obj Any) Any {
+	var result Any = Nil
+	p := &result
+	for j := list; j != Nil; j = j.Tail() {
+		x := &Cell{j.Car, Nil}
+		*p = x
+		p = &x.Cdr
+	}
+	*p = obj
+	return result
+}
+
+//----------------------------------------------------------------------
+
+// SafeEval evaluates an expression in env and returns the result and nil.
 // If an error happens, it returns Nil and the error.
-func (interp *Interp) SafeEval(exp Any, env *Env) (result Any, err Any) {
+func SafeEval(exp Any, env *Cell) (result Any, err Any) {
 	defer func() {
 		if e := recover(); e != nil {
 			result, err = Nil, e
 		}
 	}()
-	return interp.Eval(exp, env), nil
+	return Eval(exp, env), nil
 }
 
 // Read-Eval-Print Loop of the interpreter
-func (interp *Interp) ReadEvalPrintLoop(env *Env) {
+func ReadEvalPrintLoop(env *Cell) {
 	rr := NewReader(os.Stdin)
 	for {
 		os.Stdout.WriteString("> ")
@@ -708,8 +1079,8 @@ func (interp *Interp) ReadEvalPrintLoop(env *Env) {
 			if x == EofToken {
 				return
 			}
-			x, err = interp.SafeEval(x, env)
-			if err == nil && x != NoneToken {
+			x, err = SafeEval(x, env)
+			if err == nil && x != VoidToken {
 				fmt.Println(Str(x))
 			}
 		}
@@ -719,39 +1090,59 @@ func (interp *Interp) ReadEvalPrintLoop(env *Env) {
 	}
 }
 
-func (interp *Interp) ReadEvalLoop(input io.Reader, env *Env) Any {
-	var result Any = Nil
+// Non-Interactive Read-Eval Loop of the interpreter
+func ReadEvalLoop(input io.Reader, env *Cell) (result Any, err Any) {
+	result = Nil
 	rr := NewReader(input)
 	for {
 		x, err := rr.Read()
 		if err == nil {
 			if x == EofToken {
-				return result
+				return result, nil
 			}
-			result = interp.Eval(x, env)
-		} else {
-			panic(err)
+			result, err = SafeEval(x, env)
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
 }
 
+// Main runs each element of args as a name of Scheme script file.
+// It ignores args[0].
+// If it does not have args[1] or some element is "-", it begins REPL.
+func Main(args []string) int {
+	env := MakeGlobalEnv()
+	if len(args) < 2 {
+		args = []string{args[0], "-"}
+	}
+	var result Any = VoidToken
+	for i, fileName := range args {
+		if i == 0 {
+			continue
+		} else if fileName == "-" {
+			ReadEvalPrintLoop(env)
+			fmt.Println("Goodbye")
+			result = VoidToken
+		} else {
+			var err Any
+			file, err := os.Open(fileName)
+			if err == nil {
+				result, err = ReadEvalLoop(file, env)
+				file.Close()
+			}
+			if err != nil {
+				fmt.Println(err)
+				return 1
+			}
+		}
+	}
+	if result != VoidToken {
+		fmt.Println(Str(result))
+	}
+	return 0
+}
+
 func main() {
-	interp := NewInterp()
-
-	var x = List(7, 8, true, false, 9)
-	fmt.Println(x) // => (7 8 #t #f 9)
-	x.Tail().Tail().Car = x
-	fmt.Println(Str(x)) // => (7 8 (7 8 (7 ...) #f 9) #f 9)
-
-	var __ = NewSym
-	a := interp.Eval(__("*version*"), nil)
-	fmt.Println(a) // => the value of *version*
-	a = interp.Eval(List(__("cdr"), List(QuoteSym, List(1, 2, 3))), nil)
-	fmt.Println(a) // => (2 3) i.e. the value of (cdr '(1 2 3))
-
-	input := strings.NewReader("(+ 5 6)")
-	a = interp.ReadEvalLoop(input, nil)
-	fmt.Println(Str(a)) // => 11 i.e. the value of (+ 5 6)
-
-	interp.ReadEvalPrintLoop(nil)
+	os.Exit(Main(os.Args))
 }
