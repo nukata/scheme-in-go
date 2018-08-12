@@ -1,6 +1,6 @@
 # Scheme in Go
 
-- [ ] Tail Call Optimization
+- [x] Tail Call Optimization
 
 - [ ] Call with Current Continuation
 

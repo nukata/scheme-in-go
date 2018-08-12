@@ -20,7 +20,7 @@ import (
 	"sync"
 )
 
-const Version = 0.10
+const Version = 0.20
 
 type Any = interface{}
 
@@ -207,7 +207,6 @@ func GetVar(sym *Sym, env *Cell) Any {
 			if x.Car == sym {
 				return x.Cdr
 			}
-			break
 		case *Globals:
 			x.Mutex.RLock()
 			v, ok := x.Map[sym]
@@ -215,7 +214,6 @@ func GetVar(sym *Sym, env *Cell) Any {
 			if ok {
 				return v
 			}
-			break
 		default:
 			panic(NewEvalError("invalid environment", env))
 		}
@@ -234,7 +232,6 @@ func SetVar(sym *Sym, value Any, env *Cell) bool {
 				x.Cdr = value
 				return true
 			}
-			break
 		case *Globals:
 			x.Mutex.Lock()
 			_, ok := x.Map[sym]
@@ -245,7 +242,6 @@ func SetVar(sym *Sym, value Any, env *Cell) bool {
 			if ok {
 				return true
 			}
-			break
 		default:
 			panic(NewEvalError("invalid environment", env))
 		}
@@ -287,6 +283,9 @@ func (expr *Expr) String() string {
 // Subr represents an intrinsic subroutine.
 type Subr = func(*Cell) Any
 
+// ApplyType is a singleton type for the apply function.
+type ApplyType struct{}
+
 //----------------------------------------------------------------------
 
 const stackTraceMaxLength = 10
@@ -310,87 +309,119 @@ func handlePanic(expression Any) {
 // Eval always panics with an error if it panics.
 func Eval(expression Any, env *Cell) Any {
 	defer handlePanic(expression)
-	switch x := expression.(type) {
-	case *Sym:
-		return GetVar(x, env)
-	case *Cell:
-		xcar, xcdr := x.Car, x.Tail()
-		switch f := xcar.(type) {
+	for {
+		switch x := expression.(type) {
 		case *Sym:
-			if f.IsKeyword {
-				if f == QuoteSym { // (quote e)
-					return xcdr.Car
-				} else if f == IfSym { // (if cond then [else])
-					cond := Eval(xcdr.Car, env)
-					b, ok := cond.(bool)
-					if ok && !b { // if cond is #f
-						xcdddr := xcdr.Tail().Tail()
-						if xcdddr == Nil {
-							return VoidToken
+			return GetVar(x, env)
+		case *Cell:
+			xcar, xcdr := x.Car, x.Tail()
+			switch f := xcar.(type) {
+			case *Sym:
+				if f.IsKeyword {
+					switch f {
+					case QuoteSym: // (quote e)
+						return xcdr.Car
+					case IfSym: // (if cond then [else])
+						cond := Eval(xcdr.Car, env)
+						b, ok := cond.(bool)
+						if ok && !b { // if cond is #f
+							xcdddr := xcdr.Tail().Tail()
+							if xcdddr == Nil {
+								return VoidToken
+							} else {
+								expression = xcdddr.Car
+							}
 						} else {
-							return Eval(xcdddr.Car, env)
+							expression = xcdr.Tail().Car
 						}
-					} else {
-						return Eval(xcdr.Tail().Car, env)
-					}
-				} else if f == BeginSym { // (begin e...)
-					return EvalBegin(xcdr, env)
-				} else if f == LambdaSym { // (lambda (v...) e...)
-					return &Expr{xcdr.Car, xcdr.Tail(), env}
-				} else if f == SetExclSym { // (set! sym val)
-					sym := xcdr.Car.(*Sym)
-					val := Eval(xcdr.Tail().Car, env)
-					if SetVar(sym, val, env) {
+					case BeginSym: // (begin e...)
+						expression = EvalBegin(xcdr, env)
+					case LambdaSym: // (lambda (v...) e...)
+						return &Expr{xcdr.Car, xcdr.Tail(), env}
+					case SetExclSym: // (set! sym val)
+						sym := xcdr.Car.(*Sym)
+						val := Eval(xcdr.Tail().Car, env)
+						if SetVar(sym, val, env) {
+							return VoidToken
+						}
+						panic(NewEvalError("undefined variable to set", sym))
+					case DefineSym: // (define v e)
+						EvalDefine(xcdr.Car, xcdr.Tail(), env)
 						return VoidToken
+					case LetSym: // (let ((v e)...) e...)
+						bindings, body := xcdr.Head(), xcdr.Tail()
+						expression, env = EvalLet(bindings, body, env)
+					case LetrecSym: // (letrec ((v e)...) e...)
+						bindings, body := xcdr.Head(), xcdr.Tail()
+						expression, env = EvalLetrec(bindings, body, env)
+					case AndSym: // (and e...)
+						expression = EvalAnd(xcdr, env)
+					case QuasiquoteSym: // (quasiquote e)
+						expression = QqExpand(xcdr.Car)
+					default:
+						panic(NewEvalError("unknown keyword", f))
 					}
-					panic(NewEvalError("undefined variable to set", sym))
-				} else if f == DefineSym { // (define v e)
-					EvalDefine(xcdr.Car, xcdr.Tail(), env)
-					return VoidToken
-				} else if f == LetSym { // (let ((v e)...) e...)
-					return EvalLet(xcdr.Head(), xcdr.Tail(), env)
-				} else if f == LetrecSym { // (letrec ((v e)...) e...)
-					return EvalLetrec(xcdr.Head(), xcdr.Tail(), env)
-				} else if f == AndSym { // (and e...)
-					return EvalAnd(xcdr, env)
-				} else if f == QuasiquoteSym { // (quasiquote e)
-					return Eval(QqExpand(xcdr.Car), env)
+					continue // go to next loop
+				} else {
+					xcar = Eval(f, env)
 				}
-				panic(NewEvalError("unknown keyword", f))
-			} else {
+			case *Cell:
 				xcar = Eval(f, env)
 			}
-			break
-		case *Cell:
-			xcar = Eval(f, env)
+			// Evaluate each of xcdr and apply xcar to them.
+			args := EvalList(xcdr, env)
+		APPLY:
+			for {
+				switch fn := xcar.(type) {
+				case *Expr:
+					expression, env = ApplyExpr(fn, args)
+					break APPLY
+				case Subr:
+					return fn(args)
+				case *ApplyType: // (apply fun arg)
+					xcar, args = args.Car, args.Tail().Head()
+				default:
+					panic(NewEvalError("unknown function", fn))
+				}
+			}
+		default:
+			return x // numbers, strings etc.
 		}
-		return Apply(xcar, EvalList(xcdr, env))
 	}
-	return expression
 }
 
-// EvalBegin('((+ 1 2) 3 (+ 4 5)), env) returns 9 (= 4 + 5).
+// EvalBegin('(e1 ... eN), env) evaluates e1 ... e(N-1) and returns eN.
 func EvalBegin(j *Cell, env *Cell) Any {
-	var result Any = VoidToken
-	for j != Nil {
-		result = Eval(j.Car, env)
-		j = j.Tail()
+	if j == Nil {
+		return VoidToken
 	}
-	return result
+	for {
+		x := j.Car
+		j = j.Tail()
+		if j == Nil {
+			return x // eN will be evaluated at the caller Eval.
+		}
+		Eval(x, env)
+	}
 }
 
-// EvalAnd('( 1 2 3), env) returns 3.
+// EvalAnd('(1 2 (+ 3 4)), env) returns (+ 3 4).
 func EvalAnd(j *Cell, env *Cell) Any {
-	var result Any = true
-	for j != Nil {
-		result = Eval(j.Car, env)
+	if j == Nil {
+		return true
+	}
+	for {
+		x := j.Car
+		j = j.Tail()
+		if j == Nil {
+			return x
+		}
+		result := Eval(x, env)
 		b, ok := result.(bool)
 		if ok && !b {
 			return false
 		}
-		j = j.Tail()
 	}
-	return result
 }
 
 // EvalDefine(sym, body, env) defines sym as (car body) in env.
@@ -403,12 +434,10 @@ func EvalDefine(sym Any, body *Cell, env *Cell) {
 	case *Sym:
 		symbol = s
 		value = Eval(body.Car, env)
-		break
 	case *Cell:
 		symbol = s.Car.(*Sym)
 		params := s.Cdr
 		value = &Expr{params, body, env}
-		break
 	default:
 		panic(NewEvalError("invalid variable to define", sym))
 	}
@@ -416,7 +445,7 @@ func EvalDefine(sym Any, body *Cell, env *Cell) {
 }
 
 // EvalLet('((v a)...), (e...), env) evaluates ((lambda (v...) e...) a...).
-func EvalLet(bindings *Cell, body *Cell, env *Cell) Any {
+func EvalLet(bindings *Cell, body *Cell, env *Cell) (Any, *Cell) {
 	var syms *Cell = Nil
 	var vals *Cell = Nil
 	for j := bindings; j != Nil; j = j.Tail() {
@@ -425,12 +454,12 @@ func EvalLet(bindings *Cell, body *Cell, env *Cell) Any {
 		vals = &Cell{jcar.Tail().Car, vals}
 	}
 	expr := &Expr{syms, body, env}
-	return Apply(expr, EvalList(vals, env))
+	return ApplyExpr(expr, EvalList(vals, env))
 }
 
 // EvalLetrec('((v a)...), (e...), env) evaluates
 //  ((lambda (v...) (set! v a)... e...) <void>...).
-func EvalLetrec(bindings *Cell, body *Cell, env *Cell) Any {
+func EvalLetrec(bindings *Cell, body *Cell, env *Cell) (Any, *Cell) {
 	var syms *Cell = Nil
 	var voids *Cell = Nil
 	for j := bindings; j != Nil; j = j.Tail() {
@@ -441,7 +470,7 @@ func EvalLetrec(bindings *Cell, body *Cell, env *Cell) Any {
 		body = &Cell{set, body}
 	}
 	expr := &Expr{syms, body, env}
-	return Apply(expr, voids)
+	return ApplyExpr(expr, voids)
 }
 
 // EvalList('((+ 1 2) 3 (+ 4 5)), env) returns (3 3 9).
@@ -486,16 +515,10 @@ func PairList(symbols Any, values *Cell, env *Cell) *Cell {
 	panic(NewEvalError("invalid symbol(s)", symbols))
 }
 
-// Apply calls function with args.
-func Apply(function Any, args *Cell) Any {
-	switch f := function.(type) {
-	case *Expr:
-		env := PairList(f.Parameters, args, f.Environment)
-		return EvalBegin(f.Body, env)
-	case Subr:
-		return f(args)
-	}
-	panic(NewEvalError("unknown function", function))
+// ApplyExpr evaluates fn with args and returns the tail expression and env.
+func ApplyExpr(fn *Expr, args *Cell) (Any, *Cell) {
+	env := PairList(fn.Parameters, args, fn.Environment)
+	return EvalBegin(fn.Body, env), env
 }
 
 //----------------------------------------------------------------------
@@ -1001,9 +1024,7 @@ func MakeGlobalEnv() *Cell {
 		return VoidToken
 	}
 
-	m[__("apply")] = func(x *Cell) Any {
-		return Apply(x.Car, x.Tail().Head())
-	}
+	m[__("apply")] = &ApplyType{}
 	m[__("eval")] = func(x *Cell) Any {
 		return Eval(x.Car, x.Tail().Head())
 	}
