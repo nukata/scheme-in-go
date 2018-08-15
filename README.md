@@ -2,7 +2,7 @@
 
 - [x] Tail Call Optimization
 
-- [ ] Call with Current Continuation
+- [x] Call with Current Continuation
 
 ## How to run
 

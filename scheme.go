@@ -20,7 +20,7 @@ import (
 	"sync"
 )
 
-const Version = 0.21
+const Version = 0.30
 
 type Any = interface{}
 
@@ -101,6 +101,16 @@ func (j *Cell) CompareAll(fn func(Any, Any) bool) bool {
 		j = j.Tail()
 	}
 	return true
+}
+
+// (a b c d).Reverse() returns (d c b a).
+func (j *Cell) Reverse() *Cell {
+	result := Nil
+	for j != Nil {
+		result = &Cell{j.Car, result}
+		j = j.Tail()
+	}
+	return result
 }
 
 //----------------------------------------------------------------------
@@ -272,7 +282,7 @@ type Expr struct {
 	Environment *Cell
 }
 
-// expr.String() return "#[(s...)| e...| env]".
+// expr.String() returns "#[(s...)| e...| env]".
 func (expr *Expr) String() string {
 	return fmt.Sprintf("#[%v| %s| %v]",
 		expr.Parameters,
@@ -285,6 +295,93 @@ type Subr = func(*Cell) Any
 
 // ApplyType is a singleton type for the apply function.
 type ApplyType struct{}
+
+// CallCCType is a singleton type for the call/cc function.
+type CallCCType struct{}
+
+// Cont represents a continuation as a unary function.
+type Cont struct {
+	Continuation *Cell
+}
+
+// cont.String() returns a textual representation of cont.
+func (cont *Cont) String() string {
+	s := make([]string, 0, 10)
+	for j := cont.Continuation; j != Nil; j = j.Tail() {
+		s = append(s, fmt.Sprintf("%T", j.Car))
+	}
+	return "#<" + strings.Join(s, ";") + ">"
+}
+
+// NewCont copies a continuation k.
+func NewCont(k *Cell) *Cell {
+	var result Any = Nil
+	p := &result
+	for j := k; j != Nil; j = j.Tail() {
+		var v Any
+		switch x := j.Car.(type) {
+		case *ApplyCont:
+			v = &ApplyCont{x.Fun, x.Args, x.Evaluated, x.Env}
+		case *IfCont:
+			v = x // IfCont is immutable
+		case *BeginCont:
+			v = &BeginCont{x.Rest, x.Env}
+		case *SetExclCont:
+			v = x // SetExclCont is immutable
+		case *DefineCont:
+			v = x // DefineCont is immutable
+		case *AndCont:
+			v = &AndCont{x.Rest, x.Env}
+		default:
+			panic(NewEvalError("unknown continuation", x))
+		}
+		c := &Cell{v, Nil}
+		*p = c
+		p = &c.Cdr
+	}
+	return result.(*Cell)
+}
+
+// Continuation of (fn arg1 ... argN)
+type ApplyCont struct {
+	Fun       Any
+	Args      *Cell
+	Evaluated *Cell
+	Env       *Cell
+}
+
+// Continuation of (if cond then else)
+type IfCont struct {
+	Rest *Cell // (then else)
+	Env  *Cell
+}
+
+// Continuation of (begin e1 e2 ... eN)
+type BeginCont struct {
+	Rest *Cell // (e2 ... eN)
+	Env  *Cell
+}
+
+// Continuation of (set! variable e)
+type SetExclCont struct {
+	Variable *Sym
+	Env      *Cell
+}
+
+// Continuation of (define variable e)
+type DefineCont struct {
+	Variable *Sym
+	Env      *Cell
+}
+
+// Continuation of (and e1 e2 ... eN)
+type AndCont struct {
+	Rest *Cell // (e2 ... eN)
+	Env  *Cell
+}
+
+// A singleton value to represent no need of evaluation
+var doneEnv = &Cell{nil, nil}
 
 //----------------------------------------------------------------------
 
@@ -310,117 +407,175 @@ func handlePanic(expression Any) {
 // Eval will panic with an EvalError if it panics.
 func Eval(expression Any, env *Cell) Any {
 	defer handlePanic(expression)
+	var k *Cell = Nil // continuation
 	for {
-		switch x := expression.(type) {
-		case *Sym:
-			return GetVar(x, env)
-		case *Cell:
-			xcar, xcdr := x.Car, x.Tail()
-			switch f := xcar.(type) {
+	INNER_LOOP:
+		for {
+			switch x := expression.(type) {
 			case *Sym:
-				if f.IsKeyword {
-					switch f {
-					case QuoteSym: // (quote e)
-						return xcdr.Car
-					case IfSym: // (if cond then [else])
-						cond := Eval(xcdr.Car, env)
-						b, ok := cond.(bool)
-						if ok && !b { // if cond is #f
-							xcdddr := xcdr.Tail().Tail()
-							if xcdddr == Nil {
-								return VoidToken
-							} else {
-								expression = xcdddr.Car
-							}
-						} else {
-							expression = xcdr.Tail().Car
-						}
-					case BeginSym: // (begin e...)
-						expression = EvalBegin(xcdr, env)
-					case LambdaSym: // (lambda (v...) e...)
-						return &Expr{xcdr.Car, xcdr.Tail(), env}
-					case SetExclSym: // (set! sym val)
-						sym := xcdr.Car.(*Sym)
-						val := Eval(xcdr.Tail().Car, env)
-						if SetVar(sym, val, env) {
-							return VoidToken
-						}
-						panic(NewEvalError("undefined variable to set", sym))
-					case DefineSym: // (define v e)
-						EvalDefine(xcdr.Car, xcdr.Tail(), env)
-						return VoidToken
-					case LetSym: // (let ((v e)...) e...)
-						bindings, body := xcdr.Head(), xcdr.Tail()
-						expression, env = EvalLet(bindings, body, env)
-					case LetrecSym: // (letrec ((v e)...) e...)
-						bindings, body := xcdr.Head(), xcdr.Tail()
-						expression, env = EvalLetrec(bindings, body, env)
-					case AndSym: // (and e...)
-						expression = EvalAnd(xcdr, env)
-					case QuasiquoteSym: // (quasiquote e)
-						expression = QqExpand(xcdr.Car)
-					default:
-						panic(NewEvalError("unknown keyword", f))
-					}
-					continue // go to next loop
-				} else {
-					xcar = Eval(f, env)
-				}
+				expression = GetVar(x, env)
+				break INNER_LOOP
 			case *Cell:
-				xcar = Eval(f, env)
-			}
-			// Evaluate each of xcdr and apply xcar to them.
-			args := EvalList(xcdr, env)
-		APPLY:
-			for {
-				switch fn := xcar.(type) {
-				case *Expr:
-					expression, env = ApplyExpr(fn, args)
-					break APPLY
-				case Subr:
-					return fn(args)
-				case *ApplyType: // (apply fun arg)
-					xcar, args = args.Car, args.Tail().Head()
-				default:
-					panic(NewEvalError("unknown function", fn))
+				xcar, xcdr := x.Car, x.Tail()
+				switch f := xcar.(type) {
+				case *Sym:
+					if f.IsKeyword {
+						switch f {
+						case QuoteSym: // (quote e)
+							expression = xcdr.Car
+							break INNER_LOOP
+						case IfSym: // (if cond then [else])
+							k = &Cell{&IfCont{xcdr.Tail(), env}, k}
+							expression = xcdr.Car // cond
+						case BeginSym: // (begin e1...)
+							if xcdr == Nil {
+								expression = VoidToken
+								break INNER_LOOP
+							}
+							k = &Cell{&BeginCont{xcdr.Tail(), env}, k}
+							expression = xcdr.Car // e1
+						case LambdaSym: // (lambda (v...) e...)
+							expression = &Expr{xcdr.Car, xcdr.Tail(), env}
+							break INNER_LOOP
+						case SetExclSym: // (set! sym val)
+							sym := xcdr.Car.(*Sym)
+							k = &Cell{&SetExclCont{sym, env}, k}
+							expression = xcdr.Tail().Car
+						case DefineSym: // (define v e)
+							e, dk := EvalDefine(xcdr.Car, xcdr.Tail(), env)
+							expression = e
+							if dk == nil {
+								break INNER_LOOP // (define (f arg..) e..)
+							}
+							k = &Cell{dk, k}
+						case LetSym: // (let ((v e)...) e...)
+							bindings, body := xcdr.Head(), xcdr.Tail()
+							expr, vals := EvalLet(bindings, body, env)
+							k = &Cell{&ApplyCont{nil, vals, Nil, env}, k}
+							expression = expr
+							break INNER_LOOP
+						case LetrecSym: // (letrec ((v e)...) e...)
+							bindings, body := xcdr.Head(), xcdr.Tail()
+							expr, vals := EvalLetrec(bindings, body, env)
+							k = &Cell{&ApplyCont{nil, vals, Nil, env}, k}
+							expression = expr
+							break INNER_LOOP
+						case AndSym: // (and e1...)
+							if xcdr == Nil {
+								expression = true
+								break INNER_LOOP
+							}
+							k = &Cell{&AndCont{xcdr.Tail(), env}, k}
+							expression = xcdr.Car // e1
+						case QuasiquoteSym: // (quasiquote e)
+							expression = QqExpand(xcdr.Car)
+						default:
+							panic(NewEvalError("unknown keyword", f))
+						}
+					} else {
+						k = &Cell{&ApplyCont{nil, xcdr, Nil, env}, k}
+						expression = f
+					}
+				case *Cell:
+					k = &Cell{&ApplyCont{nil, xcdr, Nil, env}, k}
+					expression = f
 				}
+			default:
+				break INNER_LOOP // numbers, strings etc.
 			}
-		default:
-			return x // numbers, strings etc.
+		} // end of INNER_LOOP
+		for {
+			if k == Nil {
+				return expression
+			}
+			// Apply the continuation k to the expression value.
+			k, expression, env = ApplyContToExp(k, expression)
+			if env != doneEnv {
+				break // continue to the next OUTER LOOP
+			}
 		}
 	}
 }
 
-// EvalBegin('(e1 ... eN), env) evaluates e1 ... e(N-1) and returns eN.
-func EvalBegin(j *Cell, env *Cell) Any {
-	if j == Nil {
-		return VoidToken
-	}
-	for {
-		x := j.Car
-		j = j.Tail()
-		if j == Nil {
-			return x // eN will be evaluated at the caller Eval.
+// ApplyContToExp applies the continuation k to value.
+// It returns the next continuation, the next expression and its environment.
+// If the environment is doneEnv, the expression has been evaluated.
+func ApplyContToExp(k *Cell, value Any) (*Cell, Any, *Cell) {
+	switch cont := k.Car.(type) {
+	case *ApplyCont:
+		if cont.Fun == nil {
+			cont.Fun = value
+		} else {
+			cont.Evaluated = &Cell{value, cont.Evaluated}
 		}
-		Eval(x, env)
-	}
-}
-
-// EvalAnd('(1 2 (+ 3 4)), env) returns (+ 3 4).
-func EvalAnd(j *Cell, env *Cell) Any {
-	if j == Nil {
-		return true
-	}
-	for {
-		x := j.Car
-		j = j.Tail()
-		if j == Nil {
-			return x
+		if cont.Args == Nil {
+			return ApplyFunc(cont.Fun, cont.Evaluated.Reverse(), k.Tail())
 		}
-		result := Eval(x, env)
-		b, ok := result.(bool)
+		expression := cont.Args.Car
+		cont.Args = cont.Args.Tail()
+		return k, expression, cont.Env
+	case *IfCont: // (if cond then [else])
+		b, ok := value.(bool)
+		if ok && !b { // If cond is #f...
+			tail := cont.Rest.Tail()
+			if tail == Nil {
+				return k.Tail(), VoidToken, doneEnv
+			} else {
+				return k.Tail(), tail.Car, cont.Env
+			}
+		} else {
+			return k.Tail(), cont.Rest.Car, cont.Env
+		}
+	case *BeginCont: // (begin e1 e2 ... eN)
+		if cont.Rest == Nil {
+			return k.Tail(), value, doneEnv
+		}
+		expression := cont.Rest.Car
+		cont.Rest = cont.Rest.Tail()
+		return k, expression, cont.Env
+	case *SetExclCont: // (set! v e)
+		if SetVar(cont.Variable, value, cont.Env) {
+			return k.Tail(), VoidToken, doneEnv
+		}
+		panic(NewEvalError("undefined variable to set", cont.Variable))
+	case *DefineCont: // (define v e)
+		DefineVar(cont.Variable, value, cont.Env)
+		return k.Tail(), VoidToken, doneEnv
+	case *AndCont: // (and e1 e2 ... eN)
+		b, ok := value.(bool)
 		if ok && !b {
-			return false
+			return k.Tail(), false, doneEnv
+		}
+		if cont.Rest == Nil {
+			return k.Tail(), value, doneEnv
+		}
+		expression := cont.Rest.Car
+		cont.Rest = cont.Rest.Tail()
+		return k, expression, cont.Env
+	default:
+		panic(NewEvalError("unknown continuation", cont))
+	}
+}
+
+// ApplyFunc applies fun to arg with the continuation k.
+// It returns the next continuation, the next expression and its environment.
+func ApplyFunc(fun Any, args *Cell, k *Cell) (*Cell, Any, *Cell) {
+	// fmt.Printf("\n---%T-%v---%v---%v\n", fun, fun, args, k)
+	for {
+		switch fn := fun.(type) {
+		case *Expr:
+			env := PairList(fn.Parameters, args, fn.Environment)
+			return k, &Cell{BeginSym, fn.Body}, env
+		case Subr:
+			return k, fn(args), doneEnv
+		case *ApplyType: // (apply fun args)
+			fun, args = args.Car, args.Tail().Head()
+		case *CallCCType: // (call/cc fun)
+			fun, args = args.Car, &Cell{&Cont{NewCont(k)}, Nil}
+		case *Cont:
+			return NewCont(fn.Continuation), args.Car, doneEnv
+		default:
+			panic(NewEvalError("unknown function", fn))
 		}
 	}
 }
@@ -428,25 +583,25 @@ func EvalAnd(j *Cell, env *Cell) Any {
 // EvalDefine(sym, body, env) defines sym as (car body) in env.
 // EvalDefine('(sym (param...)), body, env) defines sym as
 // (lambda (param ...) . body) in env.
-func EvalDefine(sym Any, body *Cell, env *Cell) {
+func EvalDefine(sym Any, body *Cell, env *Cell) (Any, *DefineCont) {
 	var symbol *Sym
 	var value Any
 	switch s := sym.(type) {
 	case *Sym:
-		symbol = s
-		value = Eval(body.Car, env)
+		return body.Car, &DefineCont{s, env}
 	case *Cell:
 		symbol = s.Car.(*Sym)
 		params := s.Cdr
 		value = &Expr{params, body, env}
+		DefineVar(symbol, value, env)
+		return VoidToken, nil
 	default:
 		panic(NewEvalError("invalid variable to define", sym))
 	}
-	DefineVar(symbol, value, env)
 }
 
 // EvalLet('((v a)...), (e...), env) evaluates ((lambda (v...) e...) a...).
-func EvalLet(bindings *Cell, body *Cell, env *Cell) (Any, *Cell) {
+func EvalLet(bindings *Cell, body *Cell, env *Cell) (*Expr, *Cell) {
 	var syms *Cell = Nil
 	var vals *Cell = Nil
 	for j := bindings; j != Nil; j = j.Tail() {
@@ -454,13 +609,12 @@ func EvalLet(bindings *Cell, body *Cell, env *Cell) (Any, *Cell) {
 		syms = &Cell{jcar.Car, syms}
 		vals = &Cell{jcar.Tail().Car, vals}
 	}
-	expr := &Expr{syms, body, env}
-	return ApplyExpr(expr, EvalList(vals, env))
+	return &Expr{syms, body, env}, vals
 }
 
 // EvalLetrec('((v a)...), (e...), env) evaluates
 // ((lambda (v...) (set! v a)... e...) <void>...).
-func EvalLetrec(bindings *Cell, body *Cell, env *Cell) (Any, *Cell) {
+func EvalLetrec(bindings *Cell, body *Cell, env *Cell) (*Expr, *Cell) {
 	var syms *Cell = Nil
 	var voids *Cell = Nil
 	for j := bindings; j != Nil; j = j.Tail() {
@@ -470,21 +624,7 @@ func EvalLetrec(bindings *Cell, body *Cell, env *Cell) (Any, *Cell) {
 		set := &Cell{SetExclSym, &Cell{jcar.Car, &Cell{jcar.Tail().Car, Nil}}}
 		body = &Cell{set, body}
 	}
-	expr := &Expr{syms, body, env}
-	return ApplyExpr(expr, voids)
-}
-
-// EvalList('((+ 1 2) 3 (+ 4 5)), env) returns (3 3 9).
-func EvalList(args *Cell, env *Cell) *Cell {
-	var result Any = Nil
-	p := &result
-	for j := args; j != Nil; j = j.Tail() {
-		v := Eval(j.Car, env)
-		x := &Cell{v, Nil}
-		*p = x
-		p = &x.Cdr
-	}
-	return result.(*Cell)
+	return &Expr{syms, body, env}, voids
 }
 
 // PairList((sym1...), (val1...), env) returns ((sym1 . val1)... . env).
@@ -514,12 +654,6 @@ func PairList(symbols Any, values *Cell, env *Cell) *Cell {
 		return result.(*Cell)
 	}
 	panic(NewEvalError("invalid symbol(s)", symbols))
-}
-
-// ApplyExpr evaluates fn with args and returns the tail expression and env.
-func ApplyExpr(fn *Expr, args *Cell) (Any, *Cell) {
-	env := PairList(fn.Parameters, args, fn.Environment)
-	return EvalBegin(fn.Body, env), env
 }
 
 //----------------------------------------------------------------------
@@ -1024,6 +1158,10 @@ func MakeGlobalEnv() *Cell {
 		fmt.Println()
 		return VoidToken
 	}
+
+	callcc := &CallCCType{}
+	m[__("call/cc")] = callcc
+	m[__("call-with-current-continuation")] = callcc
 
 	m[__("apply")] = &ApplyType{}
 	m[__("eval")] = func(x *Cell) Any {
