@@ -1,5 +1,5 @@
 /*
-  Scheme-like Lisp in Go 1.10 by SUZUKI Hisao (H30.8/5 - H30.8/12)
+  Scheme-like Lisp in Go 1.10 by SUZUKI Hisao (H30.8/5 - H30.8/15)
 
   The Reader type and other portions are derived from
   Nukata Lisp in Go (https://github.com/nukata/lisp-in-go).
@@ -20,7 +20,7 @@ import (
 	"sync"
 )
 
-const Version = 0.20
+const Version = 0.21
 
 type Any = interface{}
 
@@ -31,7 +31,7 @@ var EofToken = errors.New("#end-of-file")
 // (define v e) returns VoidToken.
 var VoidToken = errors.New("#void")
 
-// EvalError implements an error in evaluation.
+// EvalError represents an error in evaluation.
 type EvalError struct {
 	Message string
 	Trace   []string
@@ -69,12 +69,12 @@ func (j *Cell) String() string {
 	return Str(j)
 }
 
-// j.Head() is (car j) as *Cell.
+// j.Head() returns (car j) as *Cell.
 func (j *Cell) Head() *Cell {
 	return j.Car.(*Cell)
 }
 
-// j.Tail() is (cdr j) as *Cell.
+// j.Tail() returns (cdr j) as *Cell.
 func (j *Cell) Tail() *Cell {
 	return j.Cdr.(*Cell)
 }
@@ -105,7 +105,7 @@ func (j *Cell) CompareAll(fn func(Any, Any) bool) bool {
 
 //----------------------------------------------------------------------
 
-// Sym represents a symbol or an expression keyword.
+// Sym represents a symbol or a keyword.
 // &Sym{name, false} constructs a symbol which is not interned yet.
 type Sym struct {
 	Name      string
@@ -123,7 +123,7 @@ func NewSym(name string) *Sym {
 	return NewSym2(name, false)
 }
 
-// NewSym2 constructs an interned symbol (or an expression keyword
+// NewSym2 constructs an interned symbol (or a keyword
 // if iskeyword is true on its first contruction) for name.
 func NewSym2(name string, isKeyword bool) *Sym {
 	symLock.Lock()
@@ -144,7 +144,7 @@ func (sym *Sym) IsInterned() bool {
 	return ok && s == sym
 }
 
-// sym.String() returns a textual representation of the Symbol sym.
+// sym.String() returns a textual representation of sym.
 func (sym *Sym) String() string {
 	if sym.IsInterned() {
 		return sym.Name
@@ -184,8 +184,8 @@ var UnquoteSplicingSym = NewSym2("unquote-splicing", true)
 
 //----------------------------------------------------------------------
 
-// Globals represents the global environment.
-// An environment will be repsensented as the list:
+// Globals represents a global environment.
+// An environment will be repsensented as the list
 // ((symbol1 . value1) ... (symbolN . valueN) globals)
 // where globals is an instance of Globals.
 type Globals struct {
@@ -193,12 +193,12 @@ type Globals struct {
 	Mutex sync.RWMutex
 }
 
-// gl.String() returns "#N-symbols".
+// gl.String() returns "#N-symbols" where N is the number of symbols in gl.
 func (gl *Globals) String() string {
 	return fmt.Sprintf("#%d-symbols", len(gl.Map))
 }
 
-// GetVar retrieves the value of sym from the environment.
+// GetVar retrieves the value of sym from env.
 func GetVar(sym *Sym, env *Cell) Any {
 	j := env
 	for j != Nil {
@@ -222,7 +222,7 @@ func GetVar(sym *Sym, env *Cell) Any {
 	panic(NewEvalError("undefined variable", sym))
 }
 
-// SetVar set the value of sym to value in the environment.
+// SetVar sets the value of sym in env to value.
 func SetVar(sym *Sym, value Any, env *Cell) bool {
 	j := env
 	for j != Nil {
@@ -250,7 +250,7 @@ func SetVar(sym *Sym, value Any, env *Cell) bool {
 	return false
 }
 
-// DefineVar define sym in the envirnment and set it to value.
+// DefineVar defines sym as value in env.
 func DefineVar(sym *Sym, value Any, env *Cell) {
 	if env != Nil {
 		if x, ok := env.Car.(*Globals); ok {
@@ -306,7 +306,8 @@ func handlePanic(expression Any) {
 	}
 }
 
-// Eval always panics with an error if it panics.
+// Eval evaluates expression in env.
+// Eval will panic with an EvalError if it panics.
 func Eval(expression Any, env *Cell) Any {
 	defer handlePanic(expression)
 	for {
@@ -458,7 +459,7 @@ func EvalLet(bindings *Cell, body *Cell, env *Cell) (Any, *Cell) {
 }
 
 // EvalLetrec('((v a)...), (e...), env) evaluates
-//  ((lambda (v...) (set! v a)... e...) <void>...).
+// ((lambda (v...) (set! v a)... e...) <void>...).
 func EvalLetrec(bindings *Cell, body *Cell, env *Cell) (Any, *Cell) {
 	var syms *Cell = Nil
 	var voids *Cell = Nil
@@ -672,8 +673,8 @@ func NewReader(r io.Reader) *Reader {
 }
 
 // Read reads an expression and returns it and nil.
-// If the input runs out, it returns EofToken and nil.
-// If an error happens, it returns Nil and the error.
+// If the input runs out, it will return EofToken and nil.
+// If an error happens, it will return Nil and the error.
 func (rr *Reader) Read() (result Any, err Any) {
 	defer func() {
 		if e := recover(); e != nil {
@@ -1079,7 +1080,7 @@ func append2Lists(list *Cell, obj Any) Any {
 
 //----------------------------------------------------------------------
 
-// SafeEval evaluates an expression in env and returns the result and nil.
+// SafeEval evaluates exp in env and returns the result and nil.
 // If an error happens, it returns Nil and the error.
 func SafeEval(exp Any, env *Cell) (result Any, err Any) {
 	defer func() {
