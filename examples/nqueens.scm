@@ -1,43 +1,43 @@
-;; N-Queens Solver in Scheme
+;; N-Queens solver in Scheme
 (define (nqueens n)
   (letrec
       ((cons-range          ; 3 lst => ((3 . lst) (2 . lst) (1 . lst))
         (lambda (n lst)
           (if (= n 0)
               '()
-              (cons (cons n lst)
-                    (cons-range (- n 1) lst)))))
+            (cons (cons n lst)
+                  (cons-range (- n 1) lst)))))
        (safe-positions?                ; (3 4 1) => #f i.e. conflicted
         (lambda (lst)
           (if (null? (cdr lst))
               #t
-              (letrec
-                  ((loop
-                    (lambda (me high low rest)
-                      (if (null? rest)
-                          #t
-                          (let ((target (car rest)))
-                            (and (not (= target me))
-                                 (not (= target high))
-                                 (not (= target low))
-                                 (loop me (+ high 1) (- low 1)
-                                       (cdr rest))))))))
-                (let ((me (car lst)))
-                  (loop me (+ me 1) (- me 1)
-                        (cdr lst)))))))
+            (letrec
+                ((loop
+                  (lambda (me high low rest)
+                    (if (null? rest)
+                        #t
+                      (let ((target (car rest)))
+                        (and (not (= target me))
+                             (not (= target high))
+                             (not (= target low))
+                             (loop me (+ high 1) (- low 1)
+                                   (cdr rest))))))))
+              (let ((me (car lst)))
+                (loop me (+ me 1) (- me 1)
+                      (cdr lst)))))))
        (loop
         (lambda (lst result)
           (if (null? lst)
               result
-              (let ((candidate (car lst)))
-                (set! lst (cdr lst))
-                (if (safe-positions? candidate)
-                    (if (= (length candidate) n)
-                        (set! result (cons candidate result))
-                        (set! lst (append (cons-range n candidate)
-                                          lst))))
-                (loop lst
-                      result))))))
+            (let ((candidate (car lst)))
+              (set! lst (cdr lst))
+              (if (safe-positions? candidate)
+                  (if (= (length candidate) n)
+                      (set! result (cons candidate result))
+                    (set! lst (append (cons-range n candidate)
+                                      lst))))
+              (loop lst
+                    result))))))
     (loop (cons-range n '())
           '())))
 
