@@ -9,8 +9,8 @@
 ## How to run
 
 ```
-$ go build scheme.go
-$ ./scheme examples/fib15.scm
+$ go build nukata-scheme.go
+$ ./nukata-scheme examples/fib15.scm
 987
 $ cat examples/fib15.scm
 (define (fib n)
@@ -20,7 +20,7 @@ $ cat examples/fib15.scm
          (fib (- n 2)))))
 (display (fib 15))
 (newline)
-$ ./scheme examples/nqueens.scm
+$ ./nukata-scheme examples/nqueens.scm
 ((5 3 1 6 4 2) (4 1 5 2 6 3) (3 6 2 5 1 4) (2 4 6 1 3 5))
 $ cat examples/yin-yang-puzzle.scm
 ;; The yin-yang puzzle 
@@ -33,8 +33,8 @@ $ cat examples/yin-yang-puzzle.scm
   (yin yang))
 
 ;; => @*@**@***@****@...
-$ ./scheme examples/yin-yang-puzzle.scm | head -c 50
-@*@**@***@****@*****@******@*******@********@*****$
-$ ./scheme
+$ ./nukata-scheme examples/yin-yang-puzzle.scm | head -c 60
+@*@**@***@****@*****@******@*******@********@*********@*****$
+$ ./nukata-scheme
 > (dump) ; the global environment and keywords will be displayed.
 ```
