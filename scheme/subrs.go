@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"reflect"
 	"runtime"
 )
 
@@ -225,60 +226,65 @@ func read_(x *Cell) Any {
 	return result
 }
 
-// MakeGlobalEnv constructs an environment which contains built-in values.
-func MakeGlobalEnv() *Cell {
-	gl := &Globals{}
-	result := &Cell{gl, Nil}
+// GlobalEnv is the environment which contains built-in values.
+var GlobalEnv = &Cell{&Globals{}, Nil}
+
+// SubrToName maps reflect.ValueOf(subr).Pointer() to subr's symbol name.
+var SubrToName = make(map[uintptr]string)
+
+func init() {
+	gl := GlobalEnv.Car.(*Globals)
 
 	var apply_ = &ApplyType{}
 	var eval_ = &EvalType{}
 	var callcc_ = &CallCCType{}
 
-	builtIns := map[*Sym]Any{
-		NewSym("car"):                            car_,
-		NewSym("cdr"):                            cdr_,
-		NewSym("cons"):                           cons_,
-		NewSym("pair?"):                          pairP_,
-		NewSym("eq?"):                            eqv_,
-		NewSym("eqv?"):                           eqv_,
-		NewSym("memq"):                           memv_,
-		NewSym("memv"):                           memv_,
-		NewSym("assq"):                           assv_,
-		NewSym("assv"):                           assv_,
-		NewSym("null?"):                          nullP_,
-		NewSym("not"):                            not_,
-		NewSym("set-car!"):                       set_car_,
-		NewSym("set-cdr!"):                       set_cdr_,
-		NewSym("list"):                           list_,
-		NewSym("reverse"):                        reverse_,
-		NewSym("append"):                         append_,
-		NewSym("caar"):                           caar_,
-		NewSym("cdar"):                           cdar_,
-		NewSym("cadr"):                           cadr_,
-		NewSym("cddr"):                           cddr_,
-		NewSym("caddr"):                          caddr_,
-		NewSym("cadddr"):                         cadddr_,
-		NewSym("length"):                         length_,
-		NewSym("+"):                              plus_,
-		NewSym("*"):                              star_,
-		NewSym("-"):                              minus_,
-		NewSym("/"):                              slash_,
-		NewSym("remainder"):                      remainder_,
-		NewSym("="):                              equal_,
-		NewSym("<"):                              lessThan_,
-		NewSym(">"):                              greaterThan_,
-		NewSym("<="):                             lessThanOrEqual_,
-		NewSym(">="):                             greaterThanOrEqual_,
-		NewSym("write"):                          write_,
-		NewSym("display"):                        display_,
-		NewSym("newline"):                        newline_,
-		NewSym("read"):                           read_,
+	var builtIns = map[*Sym]Any{
+		NewSym("car"):       car_,
+		NewSym("cdr"):       cdr_,
+		NewSym("cons"):      cons_,
+		NewSym("pair?"):     pairP_,
+		NewSym("eq?"):       eqv_,
+		NewSym("eqv?"):      eqv_,
+		NewSym("memq"):      memv_,
+		NewSym("memv"):      memv_,
+		NewSym("assq"):      assv_,
+		NewSym("assv"):      assv_,
+		NewSym("null?"):     nullP_,
+		NewSym("not"):       not_,
+		NewSym("set-car!"):  set_car_,
+		NewSym("set-cdr!"):  set_cdr_,
+		NewSym("list"):      list_,
+		NewSym("reverse"):   reverse_,
+		NewSym("append"):    append_,
+		NewSym("caar"):      caar_,
+		NewSym("cdar"):      cdar_,
+		NewSym("cadr"):      cadr_,
+		NewSym("cddr"):      cddr_,
+		NewSym("caddr"):     caddr_,
+		NewSym("cadddr"):    cadddr_,
+		NewSym("length"):    length_,
+		NewSym("+"):         plus_,
+		NewSym("*"):         star_,
+		NewSym("-"):         minus_,
+		NewSym("/"):         slash_,
+		NewSym("remainder"): remainder_,
+		NewSym("="):         equal_,
+		NewSym("<"):         lessThan_,
+		NewSym(">"):         greaterThan_,
+		NewSym("<="):        lessThanOrEqual_,
+		NewSym(">="):        greaterThanOrEqual_,
+		NewSym("write"):     write_,
+		NewSym("display"):   display_,
+		NewSym("newline"):   newline_,
+		NewSym("read"):      read_,
+
 		NewSym("apply"):                          apply_,
 		NewSym("call/cc"):                        callcc_,
 		NewSym("call-with-current-continuation"): callcc_,
 		NewSym("eval"):                           eval_,
 		NewSym("interaction-environment"): func(x *Cell) Any {
-			return result
+			return GlobalEnv
 		},
 		NewSym("dump"): func(x *Cell) Any {
 			j := Nil
@@ -330,10 +336,16 @@ func MakeGlobalEnv() *Cell {
 									__(map1, cdrs))))))),
 			__(map1, __(cons_, lst1, lsts))),
 			VoidToken, VoidToken)),
-		result}
+		GlobalEnv}
 
-	builtIns[NewSym("force")] = &Expr{__(x), __(__(x)), result}
+	builtIns[NewSym("force")] = &Expr{__(x), __(__(x)), GlobalEnv}
+
+	for sym, v := range builtIns {
+		if subr, ok := v.(Subr); ok {
+			p := reflect.ValueOf(subr).Pointer()
+			SubrToName[p] = sym.Name
+		}
+	}
 
 	gl.Map = builtIns
-	return result
 }

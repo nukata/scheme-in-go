@@ -1,5 +1,5 @@
 /*
-  Scheme in [Go 1.11] by SUZUKI Hisao (H30.8/5 - H30.8/23).
+  Scheme in [Go 1.11] by SUZUKI Hisao (H30.8/5 - H30.9/30).
 
   The Reader type and other portions are derived from
   Nukata Lisp in Go (https://github.com/nukata/lisp-in-go).
@@ -11,12 +11,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 )
 
-const Version = 0.50
+const Version = 0.51
 
 type Any = interface{}
 
@@ -281,12 +282,9 @@ type Expr struct {
 	Environment *Cell
 }
 
-// expr.String() returns "#[(s...)| e...| env]".
+// expr.String() returns a textual representation of expr.
 func (expr *Expr) String() string {
-	return fmt.Sprintf("#[%v| %s| %v]",
-		expr.Parameters,
-		strListBody(expr.Body, -1, nil),
-		expr.Environment)
+	return Str(expr)
 }
 
 // Subr represents an intrinsic subroutine.
@@ -304,18 +302,14 @@ type CallCCType struct{}
 // EvalType is a singleton type for the eval function.
 type EvalType struct{}
 
-// Cont represents a continuation as a unary function.
-type Cont struct {
+// ContType represents a continuation as a unary function.
+type ContType struct {
 	Continuation *Cell
 }
 
 // cont.String() returns a textual representation of cont.
-func (cont *Cont) String() string {
-	s := make([]string, 0, 10)
-	for j := cont.Continuation; j != Nil; j = j.Tail() {
-		s = append(s, fmt.Sprintf("%T", j.Car))
-	}
-	return "#<" + strings.Join(s, ";") + ">"
+func (cont *ContType) String() string {
+	return Str(cont)
 }
 
 // NewCont copies a continuation k.
@@ -392,7 +386,7 @@ func Eval(expression Any, env *Cell) Any {
 			if !ok {
 				ex = &EvalError{fmt.Sprintf("%v", err)}
 			}
-			ex.Message += fmt.Sprintf(" at %v", expression)
+			ex.Message += fmt.Sprintf("\n\tat %v\n%v\n", expression, k)
 			panic(ex)
 		}
 	}()
@@ -530,8 +524,8 @@ func ApplyFunc(fun Any, args *Cell, k *Cell) (Any, *Cell, *Cell) {
 		case *ApplyType: // (apply fun args)
 			fun, args = args.Car, args.Tail().Head()
 		case *CallCCType: // (call/cc fun)
-			fun, args = args.Car, &Cell{&Cont{NewCont(k)}, Nil}
-		case *Cont:
+			fun, args = args.Car, &Cell{&ContType{NewCont(k)}, Nil}
+		case *ContType:
 			return args.Car, DoneEnv, NewCont(fn.Continuation)
 		case *EvalType: // (eval expression env)
 			return args.Car, args.Tail().Head(), k
@@ -581,10 +575,18 @@ func Str(x Any) string {
 // Str2(x, quoteString) returns a textual representation of Any x.
 // If quoteString is true, a string will be represented with quotes.
 func Str2(x Any, quoteString bool) string {
-	return str4(x, quoteString, -1, nil)
+	if s, ok := x.(string); ok {
+		if quoteString {
+			return strconv.Quote(s)
+		} else {
+			return s
+		}
+	} else {
+		return str3(x, 0, nil)
+	}
 }
 
-func str4(a Any, quoteString bool, count int, printed map[*Cell]bool) string {
+func str3(a Any, count int, printed map[*Cell]bool) string {
 	switch x := a.(type) {
 	case bool:
 		if x {
@@ -598,52 +600,66 @@ func str4(a Any, quoteString bool, count int, printed map[*Cell]bool) string {
 		}
 		return "(" + strListBody(x, count, printed) + ")"
 	case string:
-		if quoteString {
-			return strconv.Quote(x)
-		} else {
-			return x
+		return strconv.Quote(x)
+	case *Expr:
+		return "#[" + str3(x.Parameters, count, printed) +
+			"| " + strListBody(x.Body, count, printed) +
+			"| " + str3(x.Environment, count, printed) + "]"
+	case *ContType:
+		return "#<" + strListBody(x.Continuation, count, printed) + ">"
+	case *ApplyCont:
+		return "\tapply " + str3(x.Fun, count, printed) +
+			" to " + str3(x.Args, count, printed) +
+			" and " + str3(x.Evaluated, count, printed) +
+			" in " + str3(x.Env, count, printed) + "\n"
+	case *IfCont:
+		return "\tthen " + str3(x.Rest.Car, count, printed) +
+			"\n\telse " + str3(x.Rest.Cdr, count, printed) +
+			"\n\tin " + str3(x.Env, count, printed) + "\n"
+	case *BeginCont:
+		return "\tbegin " + str3(x.Rest, count, printed) +
+			" in " + str3(x.Env, count, printed) + "\n"
+	case *SetQCont:
+		return "\tset! " + Str(x.Variable) +
+			" in " + str3(x.Env, count, printed) + "\n"
+	case *DefineCont:
+		return "\tdefine " + Str(x.Variable) +
+			" in " + str3(x.Env, count, printed) + "\n"
+	case Subr:
+		p := reflect.ValueOf(x).Pointer()
+		name, ok := SubrToName[p]
+		if ok {
+			return "#" + name
 		}
 	}
 	return fmt.Sprintf("%v", a)
 }
 
-const thresholdOfEllipsisForCircularLists = 4
+const thresholdOfEllipsisForCircularLists = 8
 
 func strListBody(x *Cell, count int, printed map[*Cell]bool) string {
 	if printed == nil {
 		printed = make(map[*Cell]bool)
 	}
-	if count < 0 {
-		count = thresholdOfEllipsisForCircularLists
-	}
 	s := make([]string, 0, 10)
 	y := x
 	for y != Nil {
-		if _, ok := printed[y]; ok {
-			count--
-			if count < 0 {
-				s = append(s, "...") // ellipsis for a circular list
-				return strings.Join(s, " ")
-			}
+		if count > thresholdOfEllipsisForCircularLists {
+			s = append(s, "...") // ellipsis for a circular list
+			return strings.Join(s, " ")
+		} else if count > 0 {
+			count++
+		} else if _, ok := printed[y]; ok {
+			count = 1
 		} else {
 			printed[y] = true
-			count = thresholdOfEllipsisForCircularLists
 		}
-		s = append(s, str4(y.Car, true, count, printed))
+		s = append(s, str3(y.Car, count, printed))
 		if cdr, ok := y.Cdr.(*Cell); ok {
 			y = cdr
 		} else {
 			s = append(s, ".")
-			s = append(s, str4(y.Cdr, true, count, printed))
-			break
-		}
-	}
-	y = x
-	for y != Nil {
-		delete(printed, y)
-		if cdr, ok := y.Cdr.(*Cell); ok {
-			y = cdr
-		} else {
+			s = append(s, str3(y.Cdr, count, printed))
 			break
 		}
 	}
@@ -706,7 +722,6 @@ func ReadEvalLoop(input io.Reader, env *Cell) (result Any, err Any) {
 // It ignores args[0].
 // If it does not have args[1] or some element is "-", it begins REPL.
 func Main(args []string) int {
-	env := MakeGlobalEnv()
 	if len(args) < 2 {
 		args = []string{args[0], "-"}
 	}
@@ -715,14 +730,14 @@ func Main(args []string) int {
 		if i == 0 {
 			continue
 		} else if fileName == "-" {
-			ReadEvalPrintLoop(env)
+			ReadEvalPrintLoop(GlobalEnv)
 			fmt.Println("Goodbye")
 			result = VoidToken
 		} else {
 			var err Any
 			file, err := os.Open(fileName)
 			if err == nil {
-				result, err = ReadEvalLoop(file, env)
+				result, err = ReadEvalLoop(file, GlobalEnv)
 				file.Close()
 			}
 			if err != nil {
